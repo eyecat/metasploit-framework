@@ -5,6 +5,7 @@ require 'msf/core'
 require 'msf/core/db'
 require 'msf/core/task_manager'
 require 'fileutils'
+require 'shellwords'
 
 # Provide access to ActiveRecord models shared w/ commercial versions
 require "metasploit_data_models"
@@ -13,7 +14,6 @@ require "metasploit_data_models"
 require "msf/core/patches/active_record"
 
 
-require 'fileutils'
 
 module Msf
 
@@ -36,15 +36,15 @@ class DBManager
 		end
 	end
 
-  # Only include Mdm if we're not using Metasploit commercial versions
-  # If Mdm::Host is defined, the dynamically created classes
-  # are already in the object space
-  begin
+	# Only include Mdm if we're not using Metasploit commercial versions
+	# If Mdm::Host is defined, the dynamically created classes
+	# are already in the object space
+	begin
     include MetasploitDataModels unless defined? Mdm::Host
-  rescue NameError => e
-    warn_about_rubies
-    raise e
-  end
+	rescue NameError => e
+	warn_about_rubies
+	raise e
+	end
 
 	# Provides :framework and other accessors
 	include Framework::Offspring
@@ -77,11 +77,19 @@ class DBManager
 	# Array of additional migration paths
 	attr_accessor :migration_paths
 
+	# Flag to indicate that modules are cached
+	attr_accessor :modules_cached
+
+	# Flag to indicate that the module cacher is running
+	attr_accessor :modules_caching
+
 	def initialize(framework, opts = {})
 
 		self.framework = framework
 		self.migrated  = false
 		self.migration_paths = [ ::File.join(Msf::Config.install_root, "data", "sql", "migrate") ]
+		self.modules_cached  = false
+		self.modules_caching = false
 
 		@usable = false
 
@@ -316,8 +324,24 @@ class DBManager
 		framework.db.find_workspace(@workspace_name)
 	end
 
+
+	def purge_all_module_details
+		return if not self.migrated
+		return if self.modules_caching
+
+		::ActiveRecord::Base.connection_pool.with_connection do
+			Mdm::ModuleDetail.destroy_all
+		end
+
+		true
+	end
+
 	def update_all_module_details
 		return if not self.migrated
+		return if self.modules_caching
+
+		self.modules_cached  = false
+		self.modules_caching = true
 
 		::ActiveRecord::Base.connection_pool.with_connection {
 		
@@ -360,9 +384,16 @@ class DBManager
 				next if skipped.include?( [ mt[0], mn ] )
 				obj   = mt[1].create(mn)
 				next if not obj
-				update_module_details(obj)		
+				begin
+					update_module_details(obj)
+				rescue ::Exception
+					elog("Error updating module details for #{obj.fullname}: #{$!.class} #{$!}")
+				end
 			end
 		end
+
+		self.modules_cached  = true
+		self.modules_caching = false
 
 		nil
 
@@ -489,6 +520,109 @@ class DBManager
 		res[:bits] = bits
 
 		res
+	end
+	
+	
+	
+	#
+	# This provides a standard set of search filters for every module.
+	# The search terms are in the form of:
+	#   {
+	#     "text" => [  [ "include_term1", "include_term2", ...], [ "exclude_term1", "exclude_term2"], ... ],
+	#     "cve" => [  [ "include_term1", "include_term2", ...], [ "exclude_term1", "exclude_term2"], ... ]
+	#   }
+	#
+	# Returns true on no match, false on match
+	#
+	def search_modules(search_string, inclusive=false)
+		return false if not search_string
+
+		search_string += " "
+
+		# Split search terms by space, but allow quoted strings
+		terms = Shellwords.shellwords(search_string)
+		terms.delete('')
+
+		# All terms are either included or excluded
+		res = {}
+
+		terms.each do |t|
+			f,v = t.split(":", 2)
+			if not v
+				v = f
+				f = 'text'
+			end
+			next if v.length == 0
+			f.downcase!
+			v.downcase!
+			res[f] ||= [  ]
+			res[f]  << v
+		end
+
+		::ActiveRecord::Base.connection_pool.with_connection {
+	
+		where_q = []
+		where_v = []
+
+		res.keys.each do |kt|
+			res[kt].each do |kv|
+				kv = kv.downcase
+				case kt
+				when 'text'
+					xv = "%#{kv}%"
+					where_q << ' ( ' + 
+						'module_details.fullname ILIKE ? OR module_details.name ILIKE ? OR module_details.description ILIKE ? OR ' +
+						'module_authors.name ILIKE ? OR module_actions.name ILIKE ? OR module_archs.name ILIKE ? OR ' +
+						'module_targets.name ILIKE ? OR module_platforms.name ILIKE ? ' +
+						') '
+					where_v << [ xv, xv, xv, xv, xv, xv, xv, xv ]
+				when 'name'
+					xv = "%#{kv}%"
+					where_q << ' ( module_details.fullname ILIKE ? OR module_details.name ILIKE ? ) '
+					where_v << [ xv, xv ]
+				when 'author'
+					xv = "%#{kv}%"
+					where_q << ' ( module_authors.name ILIKE ? OR module_authors.email ILIKE ? ) '
+					where_v << [ xv, xv ]
+				when 'os','platform'
+					xv = "%#{kv}%"
+					where_q << ' ( module_targets.name ILIKE ? ) '
+					where_v << [ xv ]
+				when 'port'
+					# TODO
+				when 'type'
+					where_q << ' ( module_details.mtype = ? ) '
+					where_v << [ kv ]				
+				when 'app'
+					where_q << ' ( module_details.stance = ? )'
+					where_v << [ ( kv == "client") ? "passive" : "active"  ]
+				when 'ref'
+					where_q << ' ( module_refs.name ILIKE ? )'
+					where_v << [ '%' + kv + '%' ]
+				when 'cve','bid','osvdb','edb'
+					where_q << ' ( module_refs.name = ? )'
+					where_v << [ kt.upcase + '-' + kv ]
+	
+				end
+			end
+		end
+		
+		qry = Mdm::ModuleDetail.select("DISTINCT(module_details.*)").
+			joins(
+				"LEFT OUTER JOIN module_authors   ON module_details.id = module_authors.module_detail_id " +
+				"LEFT OUTER JOIN module_actions   ON module_details.id = module_actions.module_detail_id " +
+				"LEFT OUTER JOIN module_archs     ON module_details.id = module_archs.module_detail_id " +
+				"LEFT OUTER JOIN module_refs      ON module_details.id = module_refs.module_detail_id " +
+				"LEFT OUTER JOIN module_targets   ON module_details.id = module_targets.module_detail_id " +
+				"LEFT OUTER JOIN module_platforms ON module_details.id = module_platforms.module_detail_id "
+			).
+			where(where_q.join(inclusive ? " OR " : " AND "), *(where_v.flatten)).
+			# Compatibility for Postgres installations prior to 9.1 - doesn't have support for wildcard group by clauses
+			group("module_details.id, module_details.mtime, module_details.file, module_details.mtype, module_details.refname, module_details.fullname, module_details.name, module_details.rank, module_details.description, module_details.license, module_details.privileged, module_details.disclosure_date, module_details.default_target, module_details.default_action, module_details.stance, module_details.ready")
+
+		res = qry.all
+
+		}
 	end
 
 end
