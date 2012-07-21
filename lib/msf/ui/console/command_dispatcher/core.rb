@@ -2377,7 +2377,7 @@ class Core
 		end
 
 		# Well-known option names specific to post-exploitation
-		if (mod.post?)
+		if (mod.post? or mod.exploit?)
 			return option_values_sessions() if opt.upcase == 'SESSION'
 		end
 
@@ -2414,7 +2414,12 @@ class Core
 							res << addr
 						end
 					when 'LHOST'
-						res << Rex::Socket.source_address()
+						rh = self.active_module.datastore["RHOST"]
+						if rh and not rh.empty?
+							res << Rex::Socket.source_address(rh)
+						else
+							res << Rex::Socket.source_address()
+						end
 					else
 				end
 
