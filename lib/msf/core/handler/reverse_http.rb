@@ -155,7 +155,7 @@ module ReverseHttp
 				OptString.new('MeterpreterUserAgent', [ false, 'The user-agent that the payload should use for communication', 'Mozilla/4.0 (compatible; MSIE 6.1; Windows NT)' ]),
 				OptString.new('MeterpreterServerName', [ false, 'The server header that the handler will send in response to requests', 'Apache' ]),
 				OptAddress.new('ReverseListenerBindAddress', [ false, 'The specific IP address to bind to on the local system']),
-				OptString.new('HttpUknownRequestResponse', [ false, 'The returned HTML response body when the handler receives a request that is not from a payload', '<html><body><h1>It works!</h1></body></html>'  ])
+				OptString.new('HttpUnknownRequestResponse', [ false, 'The returned HTML response body when the handler receives a request that is not from a payload', '<html><body><h1>It works!</h1></body></html>'  ])
 			], Msf::Handler::ReverseHttp)
 	end
 
@@ -327,7 +327,7 @@ protected
 				end
 				print_status("Patched Communication Timeout at offset #{i}...")
 
-				resp.body = blob
+				resp.body = encode_stage(blob)
 
 				# Short-circuit the payload's handle_connection processing for create_session
 				create_session(cli, {
@@ -360,7 +360,7 @@ protected
 				print_status("#{cli.peerhost}:#{cli.peerport} Unknown request to #{uri_match} #{req.inspect}...")
 				resp.code    = 200
 				resp.message = "OK"
-				resp.body    = datastore['HttpUknownRequestResponse'].to_s
+				resp.body    = datastore['HttpUnknownRequestResponse'].to_s
 		end
 
 		cli.send_response(resp) if (resp)
